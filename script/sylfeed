@@ -1,0 +1,143 @@
+#!/usr/bin/env perl
+package sylfeed;
+use strict;
+use warnings;
+use Config::Pit;
+use DateTime::Format::Mail;
+use Digest::MD5 qw/md5_hex/;
+use Encode;
+use Getopt::Long;
+use Log::Handler;
+use Mail::Box::MH;
+use Mail::Message;
+use Path::Class;
+use URI;
+use XML::Feed;
+
+our $VERSION = '0.03';
+
+GetOptions(\my %options, qw/verbose/) or exit 1;
+
+if ( !$ARGV[0] or $ARGV[0] ne 'update' ) {
+    print "Sylfeed $VERSION\n";
+    print "Usage: sylfeed [-v] update\n";
+    exit;
+}
+
+my $config = Config::Pit::get('sylfeed', require => {
+    time_zone => 'Asia/Tokyo',
+    folder    => "$ENV{HOME}/Mail/RSS",
+    feeds     => [ 'http://rss.rssad.jp/rss/gihyo/feed/atom' ],
+    log_file  => "$ENV{HOME}/.sylpheed-2.0/sylfeed.log",
+});
+
+my $log = Log::Handler->new(
+    file => {
+        filename   => $config->{log_file},
+        maxlevel   => 'info',
+        timeformat => '%Y-%m-%d %H:%M:%S',
+    },
+);
+
+if ( $options{verbose} ) {
+    $log->add(
+        screen => {
+            maxlevel   => 'info',
+            timeformat => '%H:%M:%S',
+        },
+    );
+}
+
+my $folder = Mail::Box::MH->new(
+    access     => 'rw',
+    folder     => dir( $config->{folder} ),
+    keep_index => 1,
+) or $log->error( "Cannot open $config->{folder}: $!" );
+
+die unless $folder;
+
+local $XML::Atom::ForceUnicode = 1;
+
+my %has_entry = map {
+    my $entry_id = $_->get( 'X-Sylpheed-Rss-Article-Identifier' );
+    $entry_id ? ( $entry_id => 1 ) : ();
+} $folder->messages;
+
+my $mime_header = Encode::find_encoding( 'MIME-Header' );
+
+my %add_link = (
+    'text/html' => sub {
+        my ( $body_ref, $link ) = @_;
+        ${ $body_ref } .= qq{\n<p><a href="$link">Read more ... </a></p>\n};
+    },
+    'text/plain' => sub {
+        my ( $body_ref, $link ) = @_;
+        ${ $body_ref } .= "\n\n$link\n";
+    },
+);
+
+$log->info( "Start updating feeds ..." );
+
+for my $url ( @{$config->{feeds}} ) {
+    $log->info( "Load $url" );
+
+    my $feed = XML::Feed->parse( URI->new($url) )
+        or $log->error( XML::Feed->errstr );
+
+    next unless $feed;
+
+    for my $entry ( $feed->entries ) {
+        my $entry_id = md5_hex( $entry->id );
+
+        next if $has_entry{ $entry_id };
+
+        $log->info( "    - Add " . $entry->id );
+
+        my $date = do {
+            my $issued = $entry->issued;
+            $issued->set_time_zone( $config->{time_zone} );
+            DateTime::Format::Mail->format_datetime( $issued );
+        };
+
+        my ( $media_type, $body );
+        for my $attr (qw/content summary/) {
+            my $content = $entry->$attr;
+            if ( $body = $content->body ) {
+                $media_type = $content->type || 'text/html';
+                last;
+            }
+        }
+
+        do { $add_link{$media_type} || sub {} }->( \$body, $entry->link );
+
+        my %header = (
+            'From'    => $feed->title,
+            'Subject' => $entry->title,
+            'Date'    => $date,
+            'X-Sylpheed-Rss-Author' => $entry->author || $feed->author,
+            'X-Sylpheed-Rss-Source-Url'          => $url,
+            'X-Sylpheed-Rss-Source-Homepage-Url' => $feed->link,
+            'X-Sylpheed-Rss-Source-Name'         => $feed->title,
+            'X-Sylpheed-Rss-Article-Url'         => $entry->link,
+            'X-Sylpheed-Rss-Article-Identifier'  => $entry_id,
+            'Content-Type' => "$media_type; charset=utf-8",
+            'Content-Transfer-Encoding' => 'quoted-printable',
+        );
+
+        @header{ keys %header }
+            = map { $mime_header->encode($_) } values %header;
+
+        $folder->addMessage(
+            Mail::Message->build(
+                %header,
+                data => Encode::encode( 'utf-8', $body ),
+            )
+        );
+    }
+}
+
+$folder->close or $log->error( "Cannot close $config->{folder}: $!" );
+
+$log->info( "Done." );
+
+1;
